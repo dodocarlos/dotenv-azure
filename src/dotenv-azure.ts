@@ -1,27 +1,27 @@
-import * as fs from 'fs'
-import { URL } from 'url'
+import { AppConfigurationClient, ConfigurationSetting } from '@azure/app-configuration'
+import { DefaultAzureCredential } from '@azure/identity'
+import { SecretClient } from '@azure/keyvault-secrets'
 import Bottleneck from 'bottleneck'
 import dotenv, { DotenvParseOptions, DotenvParseOutput } from 'dotenv'
-import { ManagedIdentityCredential, ClientSecretCredential } from '@azure/identity'
-import { SecretClient } from '@azure/keyvault-secrets'
-import { AppConfigurationClient, ConfigurationSetting } from '@azure/app-configuration'
-import { compact, difference, populateProcessEnv } from './utils'
+import * as fs from 'fs'
+import { URL } from 'url'
 import {
-  MissingEnvVarsError,
   InvalidKeyVaultUrlError,
   MissingAppConfigCredentialsError,
+  MissingEnvVarsError,
 } from './errors'
 import {
-  DotenvAzureOptions,
+  AppConfigurations,
+  AzureCredentials,
   DotenvAzureConfigOptions,
   DotenvAzureConfigOutput,
+  DotenvAzureOptions,
   DotenvAzureParseOutput,
-  VariablesObject,
-  AzureCredentials,
-  AppConfigurations,
   KeyVaultReferenceInfo,
   KeyVaultReferences,
+  VariablesObject,
 } from './types'
+import { compact, difference, populateProcessEnv } from './utils'
 
 export default class DotenvAzure {
   private readonly keyVaultRateLimitMinTime: number
@@ -100,7 +100,17 @@ export default class DotenvAzure {
     const credentials = this.getAzureCredentials(dotenvVars)
     const appConfigClient = new AppConfigurationClient(credentials.connectionString)
     const { appConfigVars, keyVaultReferences } = await this.getAppConfigurations(appConfigClient)
-    const keyVaultSecrets = await this.getSecretsFromKeyVault(credentials, keyVaultReferences)
+
+    let keyVaultSecrets = {}
+
+    try {
+      keyVaultSecrets = await this.getSecretsFromKeyVault(keyVaultReferences)
+    } catch (err) {
+      if (err instanceof Error) {
+        console.warn('[Warning] Unable to load secrets from Key Vault: ', err.message)
+      }
+    }
+
     return { ...appConfigVars, ...keyVaultSecrets }
   }
 
@@ -129,16 +139,13 @@ export default class DotenvAzure {
     return { appConfigVars, keyVaultReferences }
   }
 
-  protected async getSecretsFromKeyVault(
-    credentials: AzureCredentials,
-    vars: KeyVaultReferences
-  ): Promise<VariablesObject> {
+  protected async getSecretsFromKeyVault(vars: KeyVaultReferences): Promise<VariablesObject> {
     const secrets: VariablesObject = {}
     // limit requests to avoid Azure AD rate limiting
     const limiter = new Bottleneck({ minTime: this.keyVaultRateLimitMinTime })
 
     const getSecret = async (key: string, info: KeyVaultReferenceInfo): Promise<void> => {
-      const keyVaultClient = this.getKeyVaultClient(credentials, info.vaultUrl.href)
+      const keyVaultClient = this.getKeyVaultClient(info.vaultUrl.href)
       const response = await keyVaultClient.getSecret(info.secretName, {
         version: info.secretVersion,
       })
@@ -152,18 +159,9 @@ export default class DotenvAzure {
     return secrets
   }
 
-  protected getKeyVaultClient(credentials: AzureCredentials, vaultURL: string): SecretClient {
-    const { tenantId, clientId, clientSecret } = credentials
-
+  protected getKeyVaultClient(vaultURL: string): SecretClient {
     if (!this.keyVaultClients[vaultURL]) {
-      if (tenantId && clientId && clientSecret) {
-        this.keyVaultClients[vaultURL] = new SecretClient(
-          vaultURL,
-          new ClientSecretCredential(tenantId, clientId, clientSecret)
-        )
-      } else {
-        this.keyVaultClients[vaultURL] = new SecretClient(vaultURL, new ManagedIdentityCredential())
-      }
+      this.keyVaultClients[vaultURL] = new SecretClient(vaultURL, new DefaultAzureCredential())
     }
 
     return this.keyVaultClients[vaultURL]
@@ -204,11 +202,8 @@ export default class DotenvAzure {
 
     return {
       connectionString,
-      tenantId: this.tenantId || vars.AZURE_TENANT_ID,
-      clientId: this.clientId || vars.AZURE_CLIENT_ID,
-      clientSecret: this.clientSecret || vars.AZURE_CLIENT_SECRET,
     }
   }
 }
 
-export { dotenv, DotenvAzure }
+export { DotenvAzure, dotenv }
